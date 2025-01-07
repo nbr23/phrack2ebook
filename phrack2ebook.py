@@ -3,9 +3,9 @@ import subprocess
 import os
 import requests
 import re
-import sys
 import shutil
 import html
+import argparse
 
 def find_latest_issue():
     issueRegex = re.compile(r'phrack(\d+).tar.gz')
@@ -67,10 +67,15 @@ def html_to_mobi(html_input, output_mobi, title="My Book", author="Author Name")
     ])
 
 def main():
-    if len(sys.argv) > 1:
-        issue_number = sys.argv[1]
-    else:
+    parser = argparse.ArgumentParser(description='Download and convert Phrack issue to mobi')
+    parser.add_argument('-n', '--issue_number', help='Issue number to download (defaults to latest if not specified)', type=int)
+    parser.add_argument('-f', '--format', help='Output format (default: mobi)', default='mobi')
+    args = parser.parse_args()
+
+    if not args.issue_number:
         issue_number = find_latest_issue()
+    else:
+        issue_number = args.issue_number
 
     download_phrack_issue(issue_number)
     os.makedirs('output', exist_ok=True)
