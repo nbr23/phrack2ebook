@@ -66,17 +66,7 @@ def html_to_mobi(html_input, output, title="My Book", author="Author Name"):
         '--font-size-mapping', '12,12,12,12,12,12,12',  # Keep font sizes consistent
     ])
 
-def main():
-    parser = argparse.ArgumentParser(description='Download and convert Phrack issue to mobi')
-    parser.add_argument('-n', '--issue_number', help='Issue number to download (defaults to latest if not specified)', type=int)
-    parser.add_argument('-f', '--format', help='Output format (default: mobi)', default='mobi')
-    args = parser.parse_args()
-
-    if not args.issue_number:
-        issue_number = find_latest_issue()
-    else:
-        issue_number = args.issue_number
-
+def handle_issue(issue_number, format):
     download_phrack_issue(issue_number)
     os.makedirs('output', exist_ok=True)
 
@@ -95,6 +85,23 @@ def main():
 
     os.remove(f'output/phrack{issue_number}.html')
     shutil.rmtree(f'phrack{issue_number}', ignore_errors=True)
+
+def main():
+    parser = argparse.ArgumentParser(description='Download and convert Phrack issue to mobi')
+    parser.add_argument('-n', '--issue_number', help='Issue number to download (defaults to latest if not specified)', type=int)
+    parser.add_argument('-f', '--format', help='Output format (default: mobi)', default='mobi')
+    parser.add_argument('-a', '--all', help='Download all issues', action='store_true')
+    args = parser.parse_args()
+
+    if args.all:
+        for i in range(1, int(find_latest_issue()) + 1):
+            handle_issue(i, args.format)
+
+    if not args.issue_number:
+        issue_number = find_latest_issue()
+    else:
+        issue_number = args.issue_number
+    handle_issue(issue_number, args.format)
 
 
 if __name__ == '__main__':
