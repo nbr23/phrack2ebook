@@ -52,11 +52,11 @@ def txt_to_html(input_directory, title, filename):
     with open(filename, 'w', encoding='utf-8') as f:
         f.write('\n'.join(html_content))
 
-def html_to_mobi(html_input, output_mobi, title="My Book", author="Author Name"):
+def html_to_mobi(html_input, output, title="My Book", author="Author Name"):
     subprocess.run([
         'ebook-convert',
         html_input,
-        output_mobi,
+        output,
         '--title', title,
         '--authors', author,
         '--chapter', '//h1',  # Use h1 tags as chapter markers
@@ -87,7 +87,7 @@ def main():
     )
 
     html_to_mobi(
-        output_mobi=f'output/phrack{issue_number}.mobi',
+        output=f'output/phrack{issue_number}.{format}',
         title=f'Phrack {issue_number}',
         author='Phrack',
         html_input=f'output/phrack{issue_number}.html'
