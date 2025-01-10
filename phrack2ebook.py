@@ -59,8 +59,8 @@ def html_to_mobi(html_input, output, title="My Book", author="Author Name"):
         output,
         '--title', title,
         '--authors', author,
-        '--chapter', '//h1',  # Use h1 tags as chapter markers
-        '--page-breaks-before', '//h1',  # Add page breaks before chapters
+        '--chapter', '//h:h1',  # Use h1 tags as chapter markers
+        '--page-breaks-before', '//h:h1',  # Add page breaks before chapters
         '--change-justification', 'left',  # Left align text
         '--base-font-size', '12',
         '--font-size-mapping', '12,12,12,12,12,12,12',  # Keep font sizes consistent
