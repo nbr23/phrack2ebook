@@ -30,6 +30,8 @@ SECTION_NOISE = re.compile(r'\s*(?:-+\[|\]-*|\]?=+-*)\s*')
 
 STYLESHEET = '''
 body { margin: 0 2%; }
+.cover { margin: 0; padding: 0; text-align: center; }
+.cover img { display: block; margin: 0 auto; max-width: 100%; max-height: 100vh; }
 h1 { font-family: sans-serif; font-size: 1.4em; margin: 0.5em 0 0.2em; page-break-before: always; }
 .byline { font-family: sans-serif; font-style: italic; margin: 0 0 1.5em; }
 pre {
@@ -235,10 +237,13 @@ def build_epub(issue, articles, path):
     book.set_language('en')
     book.add_author('Phrack')
     add_series_metadata(book, issue)
-    book.set_cover('cover.jpg', make_cover(issue))
+    book.set_cover('cover.jpg', make_cover(issue), create_page=False)
 
     css = epub.EpubItem(uid='style', file_name='style.css', media_type='text/css', content=STYLESHEET)
     book.add_item(css)
+
+    cover = html_item('Cover', 'cover.xhtml', f'<div class="cover"><img src="cover.jpg" alt="Phrack #{issue}"/></div>', css)
+    book.add_item(cover)
 
     contents = html_item('Contents', 'contents.xhtml', render_contents(articles), css)
     book.add_item(contents)
@@ -251,7 +256,7 @@ def build_epub(issue, articles, path):
     book.toc = [epub.Link('contents.xhtml', 'Contents', 'contents')] + [toc_entry(a) for a in articles]
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
-    book.spine = ['cover', contents, *chapters]
+    book.spine = [cover, contents, *chapters]
     epub.write_epub(str(path), book)
 
 
