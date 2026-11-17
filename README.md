@@ -1,7 +1,7 @@
 # phrack2ebook
 Convert Phrack issues to e-reader friendly formats
 
-Each issue becomes an EPUB with one chapter per article (titled and credited from the article metadata), a navigable table of contents including article sections, a contents page, a generated cover and series metadata.
+Each issue becomes an EPUB with one chapter per article (titled and credited from the article metadata), a navigable table of contents including article sections, a contents page, a generated cover and series metadata. Images and source files that articles embed as uuencoded or base64 data are decoded and shown in place (including files split across philes); other encoded payloads such as archives are cut down to a short snippet.
 
 ## Usage
 

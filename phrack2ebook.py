@@ -7,6 +7,8 @@
 # ]
 # ///
 import argparse
+import base64
+import binascii
 import html
 import io
 import os
@@ -46,6 +48,14 @@ BASE64_MIXED = re.compile(r'^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)')
 BASE64_TAIL = re.compile(r'^[A-Za-z0-9+/]+={0,2}$')
 MIN_BASE64_RUN = 10
 MIN_BASE64_MIXED_RATIO = 0.25
+SNIPPET_LINES = 3
+UU_FULL_LINE = re.compile(r'^M[\x20-\x60]{40,61}[\x61-\x7e]?$')
+UU_LINE = re.compile(r'^[\x20-\x60]+[\x61-\x7e]?$')
+MIN_UU_RUN = 10
+PRINTABLE_BYTES = bytes([9, 10, 13, *range(32, 127)])
+MIN_TEXT_RATIO = 0.95
+IMAGE_SUFFIXES = {'.gif', '.jpg', '.jpeg', '.png', '.pcx', '.bmp'}
+EPUB_IMAGE_TYPES = {'GIF': ('image/gif', 'gif'), 'JPEG': ('image/jpeg', 'jpg'), 'PNG': ('image/png', 'png')}
 URL = re.compile(r'https?://[^\s<>"\'`{}|\\^\[\]]+')
 LINKABLE_URL = re.compile(r'https?://([\w-]+(?:\.[\w-]+)+)')
 RESERVED_TLDS = {'local', 'test', 'example', 'invalid', 'localhost', 'internal', 'lan'}
@@ -60,6 +70,9 @@ h1 { font-family: sans-serif; font-size: 1.4em; margin: 0.5em 0 0.2em; page-brea
 .byline { font-family: sans-serif; font-style: italic; margin: 0 0 1.5em; }
 pre .heading { font-weight: bold; }
 pre .omitted { font-style: italic; }
+.figure { margin: 1em 0; text-align: center; page-break-inside: avoid; }
+.figure img { max-width: 100%; max-height: 90vh; }
+.caption { font-family: sans-serif; font-size: 0.8em; font-style: italic; margin: 0.3em 0 0; }
 pre {
     white-space: pre-wrap;
     word-wrap: break-word;
@@ -85,7 +98,24 @@ class Heading(NamedTuple):
 class EncodedBlock(NamedTuple):
     start: int
     end: int
-    description: str
+    encoding: str
+    name: str | None = None
+    terminated: bool = True
+
+    @property
+    def description(self):
+        return f'{self.encoding} {self.name or "data"}'
+
+    @property
+    def continues_file(self):
+        return self.encoding == 'uuencoded' and self.name is None
+
+
+class EmbeddedImage(NamedTuple):
+    file_name: str
+    media_type: str
+    content: bytes
+    caption: str
 
 
 @dataclass
@@ -96,6 +126,7 @@ class Article:
     lines: list[str]
     sections: list[Heading] = field(default_factory=list)
     omitted: set[int] = field(default_factory=set)
+    images: dict[int, EmbeddedImage] = field(default_factory=dict)
 
     @property
     def file_name(self):
@@ -216,16 +247,19 @@ def find_sections(lines):
     return headings
 
 
-def encoded_block_end(lines, start, terminator):
-    end = start + 1
+def encoded_block_end(lines, first, terminator, line_pattern=None):
+    end = first
     while end < len(lines):
-        if lines[end] == terminator:
-            return end + 1
-        if not lines[end]:
+        line = lines[end]
+        if line == terminator:
+            return end + 1, True
+        if not line:
             # uuencode's zero-length line is a lone space, which trim_lines turns into a blank line before 'end'
-            return end + 2 if lines[end + 1:end + 2] == [terminator] else end
+            return (end + 2, True) if lines[end + 1:end + 2] == [terminator] else (end, False)
+        if line_pattern and not line_pattern.match(line):
+            return end, False
         end += 1
-    return end
+    return end, False
 
 
 def base64_run_end(lines, start):
@@ -242,6 +276,10 @@ def is_base64_payload(run):
     return len(run) >= MIN_BASE64_RUN and mixed >= MIN_BASE64_MIXED_RATIO * len(run)
 
 
+def is_uu_run(lines, start):
+    return len(lines) - start >= MIN_UU_RUN and all(UU_FULL_LINE.match(line) for line in lines[start:start + MIN_UU_RUN])
+
+
 def find_encoded_blocks(lines):
     blocks, i, in_pgp = [], 0, False
     while i < len(lines):
@@ -251,54 +289,172 @@ def find_encoded_blocks(lines):
         elif line.startswith('-----END PGP'):
             in_pgp = False
         elif match := ENCODED_BEGIN.match(line):
-            base64 = bool(match.group(1))
-            end = encoded_block_end(lines, i, '====' if base64 else 'end')
-            blocks.append(EncodedBlock(i, end, f'{"base64-encoded" if base64 else "uuencoded"} {match.group(2)}'))
+            is_base64 = bool(match.group(1))
+            end, terminated = encoded_block_end(lines, i + 1, '====' if is_base64 else 'end')
+            encoding = 'base64-encoded' if is_base64 else 'uuencoded'
+            blocks.append(EncodedBlock(i, end, encoding, match.group(2), terminated))
+            i = end
+            continue
+        elif is_uu_run(lines, i):
+            end, terminated = encoded_block_end(lines, i, 'end', UU_LINE)
+            blocks.append(EncodedBlock(i, end, 'uuencoded', None, terminated))
             i = end
             continue
         elif not in_pgp and BASE64_LINE.match(line):
             end = base64_run_end(lines, i)
             if is_base64_payload(lines[i:end]):
-                blocks.append(EncodedBlock(i, end, 'base64-encoded data'))
+                blocks.append(EncodedBlock(i, end, 'base64-encoded'))
             i = end
             continue
         i += 1
     return blocks
 
 
-def collapse_encoded(lines):
-    collapsed, omitted, pos = [], set(), 0
-    for block in find_encoded_blocks(lines):
-        collapsed.extend(lines[pos:block.start])
-        omitted.add(len(collapsed))
-        collapsed.append(f'[ {block.end - block.start:,} lines of {block.description} omitted ]')
+def decode_uu_line(line):
+    try:
+        return binascii.a2b_uu(line)
+    except binascii.Error:
+        length = (ord(line[0]) - 32) & 63
+        width = (length + 2) // 3 * 4
+        chars = line[1:1 + width].ljust(width)
+        decoded = bytearray()
+        for i in range(0, width, 4):
+            a, b, c, d = ((ord(ch) - 32) & 63 for ch in chars[i:i + 4])
+            decoded += bytes(((a << 2 | b >> 4) & 255, (b << 4 | c >> 2) & 255, (c << 6 | d) & 255))
+        return bytes(decoded[:length])
+
+
+def decode_block(lines, block):
+    if block.encoding == 'base64-encoded':
+        if block.name is None:
+            return None
+        try:
+            return base64.b64decode(''.join(line for line in lines[block.start + 1:block.end] if line != '===='))
+        except (binascii.Error, ValueError):
+            return None
+    body = lines[block.start + (block.name is not None):block.end]
+    return b''.join(decode_uu_line(line) for line in body if line and line != 'end')
+
+
+def image_payload(name, data):
+    if Path(name).suffix.lower() not in IMAGE_SUFFIXES:
+        return None
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            image.load()
+            if image.format in EPUB_IMAGE_TYPES:
+                return data, *EPUB_IMAGE_TYPES[image.format]
+            buffer = io.BytesIO()
+            image.save(buffer, format='PNG')
+            return buffer.getvalue(), *EPUB_IMAGE_TYPES['PNG']
+    except (OSError, SyntaxError, ValueError):
+        return None
+
+
+def text_payload(data):
+    if not data or b'\x00' in data:
+        return None
+    if len(data.translate(None, PRINTABLE_BYTES)) > (1 - MIN_TEXT_RATIO) * len(data):
+        return None
+    return trim_lines(clean_text(data.decode('utf-8', errors='replace')))
+
+
+def snippet(lines, block, label=None):
+    hidden = block.end - block.start - 2 * SNIPPET_LINES
+    if hidden <= 1:
+        return lines[block.start:block.end], None
+    note = f'... {hidden:,} lines of {label or block.description} omitted ...'
+    return [*lines[block.start:block.start + SNIPPET_LINES], note, *lines[block.end - SNIPPET_LINES:block.end]], SNIPPET_LINES
+
+
+class ParsedArticle(NamedTuple):
+    number: int
+    meta: dict
+    lines: list[str]
+    blocks: list[EncodedBlock]
+
+
+def parse_raw_article(number, raw):
+    meta, body = split_front_matter(clean_text(raw))
+    lines = trim_lines(body)
+    return ParsedArticle(number, meta, lines, find_encoded_blocks(lines))
+
+
+def stitch_payloads(parsed):
+    chunks, continuations, pending = {}, {}, None
+    for ai, article in enumerate(parsed):
+        for bi, block in enumerate(article.blocks):
+            key = (ai, bi)
+            data = decode_block(article.lines, block)
+            if block.continues_file and pending:
+                chunks[pending].append(data)
+                owner = parsed[pending[0]].blocks[pending[1]]
+                continuations[key] = f'{owner.description} (continued)'
+                if block.terminated:
+                    pending = None
+                continue
+            chunks[key] = [data] if data is not None else None
+            pending = key if block.encoding == 'uuencoded' and block.name and not block.terminated else None
+    payloads = {key: b''.join(parts) for key, parts in chunks.items() if parts is not None}
+    return payloads, continuations
+
+
+def expand_article(parsed, ai, payloads, continuations):
+    lines, omitted, images, pos = [], set(), {}, 0
+    for bi, block in enumerate(parsed.blocks):
+        lines.extend(parsed.lines[pos:block.start])
         pos = block.end
-    collapsed.extend(lines[pos:])
-    return collapsed, omitted
+        data = payloads.get((ai, bi))
+        if block.name and data is not None and (image := image_payload(block.name, data)):
+            content, media_type, suffix = image
+            omitted.add(len(lines))
+            images[len(lines)] = EmbeddedImage(
+                f'images/phile{parsed.number:02d}-{len(images) + 1}.{suffix}', media_type, content, block.name
+            )
+            lines.append(f'[ image: {block.name} ]')
+        elif block.name and data is not None and (text := text_payload(data)):
+            omitted.add(len(lines))
+            lines.append(f'[ {block.name}, decoded from {block.encoding.removesuffix("-encoded")} ]')
+            lines.extend(text)
+        else:
+            block_lines, note_offset = snippet(parsed.lines, block, continuations.get((ai, bi)))
+            if note_offset is not None:
+                omitted.add(len(lines) + note_offset)
+            lines.extend(block_lines)
+    lines.extend(parsed.lines[pos:])
+    return lines, omitted, images
+
+
+def build_articles(raw_articles):
+    parsed = [parse_raw_article(number, raw) for number, raw in sorted(raw_articles)]
+    payloads, continuations = stitch_payloads(parsed)
+    articles = []
+    for ai, article in enumerate(parsed):
+        lines, omitted, images = expand_article(article, ai, payloads, continuations)
+        articles.append(Article(
+            number=article.number,
+            title=article.meta.get('title') or f'Phile {article.number}',
+            author=article.meta.get('author', ''),
+            lines=lines,
+            sections=find_sections(lines),
+            omitted=omitted,
+            images=images,
+        ))
+    return articles
 
 
 def parse_article(number, raw):
-    meta, body = split_front_matter(clean_text(raw))
-    lines, omitted = collapse_encoded(trim_lines(body))
-    return Article(
-        number=number,
-        title=meta.get('title') or f'Phile {number}',
-        author=meta.get('author', ''),
-        lines=lines,
-        sections=find_sections(lines),
-        omitted=omitted,
-    )
+    return build_articles([(number, raw)])[0]
 
 
 def read_articles(tar_path):
-    articles = []
+    raw_articles = []
     with tarfile.open(tar_path) as tar:
         for member in tar.getmembers():
             stem = Path(member.name).stem
             if member.isfile() and member.name.endswith('.txt') and stem.isdigit():
-                raw = tar.extractfile(member).read().decode('utf-8', errors='replace')
-                articles.append(parse_article(int(stem), raw))
-    return sorted(articles, key=lambda a: a.number)
+                raw_articles.append((int(stem), tar.extractfile(member).read().decode('utf-8', errors='replace')))
+    return build_articles(raw_articles)
 
 
 def trim_url(url):
@@ -341,16 +497,34 @@ def render_article(article):
     for k, heading in enumerate(article.sections):
         heading_attrs[heading.start] = f' id="s{k}"'
         heading_attrs.update(dict.fromkeys(range(heading.start + 1, heading.end), ''))
-    body = []
+    parts, body = [], []
     for i, line in enumerate(article.lines):
+        if i in article.images:
+            parts.append(render_pre(body))
+            parts.append(render_figure(article.images[i]))
+            body = []
+            continue
         escaped = linkify(line)
         if i in heading_attrs:
             escaped = f'<span class="heading"{heading_attrs[i]}>{escaped}</span>'
         elif i in article.omitted:
             escaped = f'<span class="omitted">{escaped}</span>'
         body.append(escaped)
+    parts.append(render_pre(body))
     byline = f'<p class="byline">{html.escape(article.author)}</p>' if article.author else ''
-    return f'<h1>{html.escape(article.title)}</h1>{byline}<pre>{chr(10).join(body)}</pre>'
+    return f'<h1>{html.escape(article.title)}</h1>{byline}{"".join(parts)}'
+
+
+def render_pre(body):
+    return f'<pre>{chr(10).join(body)}</pre>' if body else ''
+
+
+def render_figure(image):
+    caption = html.escape(image.caption)
+    return (
+        f'<div class="figure"><img src="{html.escape(image.file_name)}" alt="{caption}"/>'
+        f'<p class="caption">{caption}</p></div>'
+    )
 
 
 def render_contents(articles):
@@ -436,6 +610,10 @@ def build_epub(issue, articles, path, date=None):
     book.add_item(contents)
     chapters = []
     for article in articles:
+        for image in article.images.values():
+            book.add_item(epub.EpubImage(
+                uid=Path(image.file_name).stem, file_name=image.file_name, media_type=image.media_type, content=image.content
+            ))
         chapter = html_item(article.title, article.file_name, render_article(article), css)
         book.add_item(chapter)
         chapters.append(chapter)
