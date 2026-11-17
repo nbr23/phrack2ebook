@@ -1,108 +1,324 @@
-import glob
-import subprocess
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "requests>=2.31",
+#     "ebooklib>=0.18",
+#     "pillow>=10.1",
+# ]
+# ///
+import argparse
+import html
+import io
 import os
-import requests
 import re
 import shutil
-import html
-import argparse
+import subprocess
+import sys
+import tarfile
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
 
-def find_latest_issue():
-    issueRegex = re.compile(r'phrack(\d+).tar.gz')
-    issues_list = requests.get('https://archives.phrack.org/tgz/')
+import requests
+from ebooklib import epub
+from PIL import Image, ImageDraw, ImageFont
 
-    return issueRegex.findall(issues_list.text).pop()
+ARCHIVE_URL = 'https://archives.phrack.org/tgz/'
+CONTROL_CHARS = re.compile(r'[\x00-\x08\x0b-\x1f\x7f]')
+SECTION_LINE = re.compile(r'^\s*-{1,4}\[(?!\[)\s*(.+?)\s*$')
+SECTION_NOISE = re.compile(r'\s*(?:-+\[|\]-*|\]?=+-*)\s*')
 
-def download_phrack_issue(issue_number):
-    url = f'https://archives.phrack.org/tgz/phrack{issue_number}.tar.gz'
-    print(f'Downloading Phrack issue {issue_number} from {url}')
-    os.makedirs(f'phrack{issue_number}', exist_ok=True)
-    output = f'phrack{issue_number}/phrack{issue_number}.tar.gz'
-    subprocess.run(['curl', '-qo', output, url])
-    print(f'Extracting {output}')
-    subprocess.run(['tar', '-xf', output, '-C', f'phrack{issue_number}'])
-    print(f'Cleaning up {output}')
-    os.remove(output)
+STYLESHEET = '''
+body { margin: 0 2%; }
+h1 { font-family: sans-serif; font-size: 1.4em; margin: 0.5em 0 0.2em; page-break-before: always; }
+.byline { font-family: sans-serif; font-style: italic; margin: 0 0 1.5em; }
+pre {
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    font-family: monospace;
+    font-size: 0.7em;
+    line-height: 1.2;
+    margin: 0;
+}
+ol.contents { padding-left: 1.5em; font-family: sans-serif; }
+ol.contents li { margin: 0 0 0.6em; }
+ol.contents a { text-decoration: none; }
+ol.contents .author { display: block; font-size: 0.85em; font-style: italic; }
+'''
 
-def txt_to_html(input_directory, title, filename):
-    txt_files = sorted(glob.glob(os.path.join(input_directory, '*.txt')), 
-                      key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
-    
-    html_content = [
-        "<!DOCTYPE html>",
-        "<html>",
-        "<head>",
-        "<title>{}</title>".format(title),
-        "</head>",
-        "<body>"
+
+@dataclass
+class Article:
+    number: int
+    title: str
+    author: str
+    lines: list[str]
+    sections: list[tuple[int, str]] = field(default_factory=list)
+
+    @property
+    def file_name(self):
+        return f'phile{self.number:02d}.xhtml'
+
+
+def latest_issue():
+    response = requests.get(ARCHIVE_URL, timeout=30)
+    response.raise_for_status()
+    return max(int(n) for n in re.findall(r'phrack(\d+)\.tar\.gz', response.text))
+
+
+def default_cache_dir():
+    base = os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache'
+    return Path(base) / 'phrack2ebook'
+
+
+def fetch_issue(issue, cache_dir):
+    target = cache_dir / f'phrack{issue}.tar.gz'
+    if target.exists():
+        return target
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    url = f'{ARCHIVE_URL}phrack{issue}.tar.gz'
+    print(f'Downloading {url}')
+    partial = target.with_name(target.name + '.part')
+    with requests.get(url, stream=True, timeout=30) as response:
+        response.raise_for_status()
+        with open(partial, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=1 << 16):
+                f.write(chunk)
+    partial.rename(target)
+    return target
+
+
+def clean_text(text):
+    text = text.replace('\r\n', '\n').replace('\r', '\n').expandtabs(8)
+    return CONTROL_CHARS.sub('', text)
+
+
+def split_front_matter(text):
+    if not text.startswith('---\n'):
+        return {}, text
+    end = text.find('\n---\n', 4)
+    if end == -1:
+        return {}, text
+    meta = {}
+    for line in text[4:end].splitlines():
+        key, sep, value = line.partition(':')
+        if sep:
+            meta[key.strip().lower()] = value.strip().strip('"\'')
+    return meta, text[end + 5:]
+
+
+def trim_lines(text):
+    lines = [line.rstrip() for line in text.split('\n')]
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    return lines
+
+
+def section_label(line):
+    match = SECTION_LINE.match(line)
+    if not match:
+        return None
+    label = ' '.join(SECTION_NOISE.sub(' ', match.group(1)).split()).strip(' -=]')
+    if not re.search(r'\w', label) or len(label) > 80 or label.upper().startswith('END'):
+        return None
+    return label
+
+
+def find_sections(lines):
+    return [(i, label) for i, line in enumerate(lines) if (label := section_label(line))]
+
+
+def parse_article(number, raw):
+    meta, body = split_front_matter(clean_text(raw))
+    lines = trim_lines(body)
+    return Article(
+        number=number,
+        title=meta.get('title') or f'Phile {number}',
+        author=meta.get('author', ''),
+        lines=lines,
+        sections=find_sections(lines),
+    )
+
+
+def read_articles(tar_path):
+    articles = []
+    with tarfile.open(tar_path) as tar:
+        for member in tar.getmembers():
+            stem = Path(member.name).stem
+            if member.isfile() and member.name.endswith('.txt') and stem.isdigit():
+                raw = tar.extractfile(member).read().decode('utf-8', errors='replace')
+                articles.append(parse_article(int(stem), raw))
+    return sorted(articles, key=lambda a: a.number)
+
+
+def render_article(article):
+    anchors = {line: k for k, (line, _) in enumerate(article.sections)}
+    body = []
+    for i, line in enumerate(article.lines):
+        escaped = html.escape(line, quote=False)
+        if i in anchors:
+            escaped = f'<span id="s{anchors[i]}"></span>{escaped}'
+        body.append(escaped)
+    byline = f'<p class="byline">{html.escape(article.author)}</p>' if article.author else ''
+    return f'<h1>{html.escape(article.title)}</h1>{byline}<pre>{chr(10).join(body)}</pre>'
+
+
+def render_contents(articles):
+    items = []
+    for a in articles:
+        author = f'<span class="author">{html.escape(a.author)}</span>' if a.author else ''
+        items.append(f'<li><a href="{a.file_name}">{html.escape(a.title)}</a>{author}</li>')
+    return f'<h1>Contents</h1><ol class="contents">{"".join(items)}</ol>'
+
+
+def fitted_font(draw, text, size, max_width):
+    font = ImageFont.load_default(size=size)
+    while draw.textlength(text, font=font) > max_width and size > 10:
+        size -= 10
+        font = ImageFont.load_default(size=size)
+    return font
+
+
+def draw_centered(draw, y, text, font, fill, width):
+    x = (width - draw.textlength(text, font=font)) / 2
+    draw.text((x, y), text, font=font, fill=fill)
+
+
+def make_cover(issue):
+    width, height = 1600, 2560
+    fg, dim = (80, 255, 120), (40, 140, 70)
+    image = Image.new('RGB', (width, height), (8, 10, 8))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((60, 60, width - 60, height - 60), outline=dim, width=6)
+    draw_centered(draw, 260, '==Phrack Inc.==', fitted_font(draw, '==Phrack Inc.==', 90, 1200), dim, width)
+    draw_centered(draw, 900, 'PHRACK', fitted_font(draw, 'PHRACK', 380, 1320), fg, width)
+    draw_centered(draw, 1400, f'Issue #{issue}', ImageFont.load_default(size=160), fg, width)
+    draw_centered(draw, 1620, f'0x{issue:02x}', ImageFont.load_default(size=110), dim, width)
+    draw_centered(draw, 2300, 'by hackers, for hackers', ImageFont.load_default(size=70), dim, width)
+    buffer = io.BytesIO()
+    image.save(buffer, format='JPEG', quality=90)
+    return buffer.getvalue()
+
+
+def add_series_metadata(book, issue):
+    book.add_metadata(None, 'meta', '', {'name': 'calibre:series', 'content': 'Phrack'})
+    book.add_metadata(None, 'meta', '', {'name': 'calibre:series_index', 'content': str(issue)})
+    book.add_metadata(None, 'meta', 'Phrack', {'property': 'belongs-to-collection', 'id': 'series'})
+    book.add_metadata(None, 'meta', 'series', {'refines': '#series', 'property': 'collection-type'})
+    book.add_metadata(None, 'meta', str(issue), {'refines': '#series', 'property': 'group-position'})
+
+
+def html_item(title, file_name, content, css):
+    item = epub.EpubHtml(title=title, file_name=file_name, lang='en')
+    item.content = content
+    item.add_item(css)
+    return item
+
+
+def toc_entry(article):
+    if not article.sections:
+        return epub.Link(article.file_name, article.title, f'p{article.number}')
+    links = [
+        epub.Link(f'{article.file_name}#s{k}', label, f'p{article.number}s{k}')
+        for k, (_, label) in enumerate(article.sections)
     ]
-    
-    for i, txt_file in enumerate(txt_files, 1):
-        with open(txt_file, 'r', encoding='utf-8') as f:
-            content = html.escape(f.read())
-            content = '<p>' + '</p><p>'.join(content.split('\n')) + '</p>'
-            html_content.extend([
-                f"<h1>Chapter {i}</h1>",
-                "<pre>",  # Use <pre> tag to preserve formatting and use monospace font
-                content,
-                "</pre>"
-            ])
-    
-    html_content.append("</body></html>")
-    with open(filename, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(html_content))
+    return (epub.Section(article.title, article.file_name), links)
 
-def html_to_mobi(html_input, output, title="My Book", author="Author Name"):
-    subprocess.run([
-        'ebook-convert',
-        html_input,
-        output,
-        '--title', title,
-        '--authors', author,
-        '--language', 'en',
-        '--chapter', '//h:h1',  # Use h1 tags as chapter markers
-        '--page-breaks-before', '//h:h1',  # Add page breaks before chapters
-        '--change-justification', 'left',  # Left align text
-        '--base-font-size', '10',
-        '--font-size-mapping', '10,10,10,12,12,12,12',  # Keep font sizes consistent
-    ])
 
-def handle_issue(issue_number, format):
-    download_phrack_issue(issue_number)
-    os.makedirs('output', exist_ok=True)
+def build_epub(issue, articles, path):
+    book = epub.EpubBook()
+    book.set_identifier(f'phrack-{issue}')
+    book.set_title(f'Phrack #{issue}')
+    book.set_language('en')
+    book.add_author('Phrack')
+    add_series_metadata(book, issue)
+    book.set_cover('cover.jpg', make_cover(issue))
 
-    txt_to_html(
-        input_directory=f'phrack{issue_number}',
-        title=f'Phrack {issue_number}',
-        filename=f'output/phrack{issue_number}.html'
-    )
+    css = epub.EpubItem(uid='style', file_name='style.css', media_type='text/css', content=STYLESHEET)
+    book.add_item(css)
 
-    html_to_mobi(
-        output=f'output/phrack{issue_number}.{format}',
-        title=f'Phrack {issue_number}',
-        author='Phrack',
-        html_input=f'output/phrack{issue_number}.html'
-    )
+    contents = html_item('Contents', 'contents.xhtml', render_contents(articles), css)
+    book.add_item(contents)
+    chapters = []
+    for article in articles:
+        chapter = html_item(article.title, article.file_name, render_article(article), css)
+        book.add_item(chapter)
+        chapters.append(chapter)
 
-    os.remove(f'output/phrack{issue_number}.html')
-    shutil.rmtree(f'phrack{issue_number}', ignore_errors=True)
+    book.toc = [epub.Link('contents.xhtml', 'Contents', 'contents')] + [toc_entry(a) for a in articles]
+    book.add_item(epub.EpubNcx())
+    book.add_item(epub.EpubNav())
+    book.spine = ['cover', contents, *chapters]
+    epub.write_epub(str(path), book)
+
+
+def convert(epub_path, out_path):
+    subprocess.run(['ebook-convert', str(epub_path), str(out_path)], check=True, stdout=subprocess.DEVNULL)
+
+
+def handle_issue(issue, fmt, output_dir, cache_dir):
+    articles = read_articles(fetch_issue(issue, cache_dir))
+    if not articles:
+        raise RuntimeError(f'no articles found in Phrack {issue}')
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / f'phrack{issue}.{fmt}'
+    if fmt == 'epub':
+        build_epub(issue, articles, out_path)
+    else:
+        with tempfile.TemporaryDirectory() as tmp:
+            epub_path = Path(tmp) / f'phrack{issue}.epub'
+            build_epub(issue, articles, epub_path)
+            convert(epub_path, out_path)
+    print(f'Phrack {issue}: {len(articles)} articles -> {out_path}')
+
+
+def parse_issue_spec(spec):
+    issues = set()
+    for part in spec.split(','):
+        start, sep, end = part.strip().partition('-')
+        if not start.isdigit() or (sep and not end.isdigit()):
+            raise ValueError(f'invalid issue spec: {part!r}')
+        first, last = int(start), int(end) if sep else int(start)
+        if first < 1 or last < first:
+            raise ValueError(f'invalid issue range: {part!r}')
+        issues.update(range(first, last + 1))
+    return sorted(issues)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Download Phrack issues and convert them to ebooks')
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument('-n', '--issue', help='Issue(s) to convert, e.g. 72, 60-73 or 1,5,70-72 (default: latest)')
+    selection.add_argument('-a', '--all', action='store_true', help='Convert every issue')
+    parser.add_argument('-f', '--format', default='epub', help='Output format; non-epub formats need calibre (default: epub)')
+    parser.add_argument('-o', '--output-dir', type=Path, default=Path('output'), help='Output directory (default: output)')
+    parser.add_argument('--cache-dir', type=Path, default=default_cache_dir(), help='Download cache directory')
+    args = parser.parse_args()
+    if args.issue:
+        try:
+            args.issues = parse_issue_spec(args.issue)
+        except ValueError as e:
+            parser.error(str(e))
+    return args
+
 
 def main():
-    parser = argparse.ArgumentParser(description='Download and convert Phrack issue to mobi')
-    parser.add_argument('-n', '--issue_number', help='Issue number to download (defaults to latest if not specified)', type=int)
-    parser.add_argument('-f', '--format', help='Output format (default: mobi)', default='mobi')
-    parser.add_argument('-a', '--all', help='Download all issues', action='store_true')
-    args = parser.parse_args()
-
-    if args.all:
-        for i in range(1, int(find_latest_issue()) + 1):
-            handle_issue(i, args.format)
-
-    if not args.issue_number:
-        issue_number = find_latest_issue()
-    else:
-        issue_number = args.issue_number
-    handle_issue(issue_number, args.format)
+    args = parse_args()
+    fmt = args.format.lower().lstrip('.')
+    if fmt != 'epub' and not shutil.which('ebook-convert'):
+        sys.exit(f'error: ebook-convert (calibre) is required to produce {fmt} output')
+    try:
+        if args.all:
+            args.issues = list(range(1, latest_issue() + 1))
+        elif not args.issue:
+            args.issues = [latest_issue()]
+        for issue in args.issues:
+            handle_issue(issue, fmt, args.output_dir, args.cache_dir)
+    except (requests.RequestException, RuntimeError, subprocess.CalledProcessError, tarfile.TarError) as e:
+        sys.exit(f'error: {e}')
 
 
 if __name__ == '__main__':
