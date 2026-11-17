@@ -33,3 +33,9 @@ Downloaded issues are cached in `$XDG_CACHE_HOME/phrack2ebook` (or `~/.cache/phr
 The publication date is taken from the issue's release date on phrack.org; if the site is unreachable the book is built without one.
 
 EPUB works with Kobo and other readers, and with Kindle via Send to Kindle. Other formats (`mobi`, `azw3`, `pdf`, ...) are produced from the EPUB with calibre's `ebook-convert`, which must be on `PATH`.
+
+## Tests
+
+```
+uv run --no-project --with-requirements phrack2ebook.py --with pytest -- pytest
+```

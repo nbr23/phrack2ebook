@@ -26,6 +26,10 @@ from ebooklib import epub
 from PIL import Image, ImageDraw, ImageFont
 
 ARCHIVE_URL = 'https://archives.phrack.org/tgz/'
+OUTPUT_FORMATS = (
+    'epub', 'azw3', 'docx', 'fb2', 'htmlz', 'lit', 'lrf', 'mobi', 'oeb', 'pdb',
+    'pdf', 'pml', 'rb', 'rtf', 'snb', 'tcr', 'txt', 'txtz', 'zip',
+)
 SITE_URL = 'https://phrack.org/'
 CANONICAL_LINK = re.compile(r'<link rel="canonical" href="([^"]+)"')
 DATE_PUBLISHED = re.compile(r'"datePublished":"(\d{4}-\d{2}-\d{2})"')
@@ -402,12 +406,19 @@ def parse_issue_spec(spec):
     return sorted(issues)
 
 
+def output_format(value):
+    return value.lower().lstrip('.')
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Download Phrack issues and convert them to ebooks')
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument('-n', '--issue', help='Issue(s) to convert, e.g. 72, 60-73 or 1,5,70-72 (default: latest)')
     selection.add_argument('-a', '--all', action='store_true', help='Convert every issue')
-    parser.add_argument('-f', '--format', default='epub', help='Output format; non-epub formats need calibre (default: epub)')
+    parser.add_argument(
+        '-f', '--format', type=output_format, choices=OUTPUT_FORMATS, default='epub', metavar='FORMAT',
+        help=f'Output format: {", ".join(OUTPUT_FORMATS)}; non-epub formats need calibre (default: epub)',
+    )
     parser.add_argument('-o', '--output-dir', type=Path, default=Path('output'), help='Output directory (default: output)')
     parser.add_argument('--cache-dir', type=Path, default=default_cache_dir(), help='Download cache directory')
     parser.add_argument('--force', action='store_true', help='Rebuild issues whose output file already exists')
@@ -422,7 +433,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    fmt = args.format.lower().lstrip('.')
+    fmt = args.format
     if fmt != 'epub' and not shutil.which('ebook-convert'):
         sys.exit(f'error: ebook-convert (calibre) is required to produce {fmt} output')
     try:
