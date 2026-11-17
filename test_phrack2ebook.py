@@ -1,8 +1,15 @@
+import base64
+import binascii
+import random
+
 import pytest
 
 from phrack2ebook import (
+    EncodedBlock,
     Heading,
     clean_text,
+    collapse_encoded,
+    find_encoded_blocks,
     find_sections,
     linkify,
     output_format,
@@ -219,3 +226,82 @@ def test_render_article_marks_headings_with_anchor_and_escapes():
     assert '<span class="heading" id="s0">--[ 5.5 - Improper SMM' in rendered
     assert '<span class="heading">Management Mode (SMM) Modification</span>' in rendered
     assert 'if (a &lt; b) return;' in rendered
+
+
+def uuencoded(size):
+    data = random.Random(size).randbytes(size)
+    return [binascii.b2a_uu(data[i:i + 45]).decode().rstrip('\n').rstrip() for i in range(0, size, 45)]
+
+
+def base64_lines(data):
+    return base64.encodebytes(data).decode().splitlines()
+
+
+def random_base64(size):
+    return base64_lines(random.Random(size).randbytes(size))
+
+
+def test_uuencoded_block_ends_at_end_marker_and_keeps_trailing_lines():
+    lines = ['<++> code.tgz.uue', 'begin 644 code.tgz', *uuencoded(900), '`', 'end', 'sum -r/size 1/2', '<-->']
+    assert find_encoded_blocks(lines) == [EncodedBlock(1, len(lines) - 2, 'uuencoded code.tgz')]
+
+
+def test_uuencoded_block_spans_blank_zero_length_line_before_end():
+    lines = ['begin 644 hack.exe', *uuencoded(900), '', 'end', '', 'text']
+    assert find_encoded_blocks(lines) == [EncodedBlock(0, len(lines) - 2, 'uuencoded hack.exe')]
+
+
+def test_unterminated_uuencoded_block_ends_at_blank_line():
+    lines = ['begin 644 GAME.PCX', *uuencoded(900), '', 'end', 'sum -r/size 20457/59873']
+    lines[len(lines) - 2] = 'not the terminator'
+    assert find_encoded_blocks(lines) == [EncodedBlock(0, 21, 'uuencoded GAME.PCX')]
+
+
+def test_unterminated_uuencoded_block_runs_to_end_of_file():
+    lines = ['begin 644 NORAD.JPG', *uuencoded(900)]
+    assert find_encoded_blocks(lines) == [EncodedBlock(0, len(lines), 'uuencoded NORAD.JPG')]
+
+
+def test_begin_base64_block_ends_at_equals_marker():
+    lines = ['begin-base64 644 bitstring.tar.xz', *random_base64(2000), '====', '<-->']
+    assert find_encoded_blocks(lines) == [EncodedBlock(0, len(lines) - 1, 'base64-encoded bitstring.tar.xz')]
+
+
+def test_bare_base64_run_includes_short_tail_line():
+    payload = random_base64(2000)
+    lines = ['>>>base64-begin code.zip', *payload, '<<<base64-end']
+    assert len(payload[-1]) < 40
+    assert find_encoded_blocks(lines) == [EncodedBlock(1, len(lines) - 1, 'base64-encoded data')]
+
+
+def test_bare_base64_binary_with_zero_padding_is_one_block():
+    data = random.Random(1).randbytes(1500) + bytes(3000) + random.Random(2).randbytes(1500)
+    lines = ['text', *base64_lines(data), 'text']
+    assert find_encoded_blocks(lines) == [EncodedBlock(1, len(lines) - 1, 'base64-encoded data')]
+
+
+@pytest.mark.parametrize(
+    'lines',
+    [
+        ['$ ./a.out', *['A' * 75] * 7, 'MAIN_: size is 520'],
+        ['expn ' + 'x' * 70, *['x' * 78] * 11],
+        ['short run', *random_base64(400)],
+        ['-----BEGIN PGP PUBLIC KEY BLOCK-----', '', *random_base64(2000), '=1iyt', '-----END PGP PUBLIC KEY BLOCK-----'],
+    ],
+)
+def test_find_encoded_blocks_keeps_padding_short_runs_and_pgp(lines):
+    assert find_encoded_blocks(lines) == []
+
+
+def test_collapse_encoded_replaces_block_with_note():
+    lines = ['intro', 'begin 644 code.tgz', *uuencoded(90), '`', 'end', 'outro']
+    assert collapse_encoded(lines) == (['intro', '[ 5 lines of uuencoded code.tgz omitted ]', 'outro'], {1})
+
+
+def test_parse_article_collapses_blobs_before_finding_sections():
+    raw = '\n'.join(['--[ 1 - Intro', 'begin 644 code.tgz', *uuencoded(900), '`', 'end', '', '--[ 2 - Code', 'x'])
+    article = parse_article(1, raw)
+    assert article.lines[1] == '[ 23 lines of uuencoded code.tgz omitted ]'
+    assert article.omitted == {1}
+    assert [(h.start, h.label) for h in article.sections] == [(0, '1 - Intro'), (3, '2 - Code')]
+    assert '<span class="omitted">[ 23 lines of uuencoded code.tgz omitted ]</span>' in render_article(article)

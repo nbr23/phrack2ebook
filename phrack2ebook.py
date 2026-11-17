@@ -40,6 +40,12 @@ SECTION_REJECT = re.compile(r'@[^\]]*\][$#%]|\]-*>')
 SECTION_CLOSED = re.compile(r'\]\s*[-=]*\s*$')
 WRAPPED_HEADING_MIN_LENGTH = 60
 MAX_HEADING_CONTINUATIONS = 2
+ENCODED_BEGIN = re.compile(r'^begin(-base64)? [0-7]{3,4} (\S.*)$')
+BASE64_LINE = re.compile(r'^[A-Za-z0-9+/]{40,}={0,2}$')
+BASE64_MIXED = re.compile(r'^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)')
+BASE64_TAIL = re.compile(r'^[A-Za-z0-9+/]+={0,2}$')
+MIN_BASE64_RUN = 10
+MIN_BASE64_MIXED_RATIO = 0.25
 URL = re.compile(r'https?://[^\s<>"\'`{}|\\^\[\]]+')
 LINKABLE_URL = re.compile(r'https?://([\w-]+(?:\.[\w-]+)+)')
 RESERVED_TLDS = {'local', 'test', 'example', 'invalid', 'localhost', 'internal', 'lan'}
@@ -53,6 +59,7 @@ a { color: inherit; }
 h1 { font-family: sans-serif; font-size: 1.4em; margin: 0.5em 0 0.2em; page-break-before: always; }
 .byline { font-family: sans-serif; font-style: italic; margin: 0 0 1.5em; }
 pre .heading { font-weight: bold; }
+pre .omitted { font-style: italic; }
 pre {
     white-space: pre-wrap;
     word-wrap: break-word;
@@ -75,6 +82,12 @@ class Heading(NamedTuple):
     label: str
 
 
+class EncodedBlock(NamedTuple):
+    start: int
+    end: int
+    description: str
+
+
 @dataclass
 class Article:
     number: int
@@ -82,6 +95,7 @@ class Article:
     author: str
     lines: list[str]
     sections: list[Heading] = field(default_factory=list)
+    omitted: set[int] = field(default_factory=set)
 
     @property
     def file_name(self):
@@ -202,15 +216,77 @@ def find_sections(lines):
     return headings
 
 
+def encoded_block_end(lines, start, terminator):
+    end = start + 1
+    while end < len(lines):
+        if lines[end] == terminator:
+            return end + 1
+        if not lines[end]:
+            # uuencode's zero-length line is a lone space, which trim_lines turns into a blank line before 'end'
+            return end + 2 if lines[end + 1:end + 2] == [terminator] else end
+        end += 1
+    return end
+
+
+def base64_run_end(lines, start):
+    end = start
+    while end < len(lines) and BASE64_LINE.match(lines[end]):
+        end += 1
+    if end < len(lines) and BASE64_TAIL.match(lines[end]):
+        end += 1
+    return end
+
+
+def is_base64_payload(run):
+    mixed = sum(1 for line in run if BASE64_MIXED.match(line))
+    return len(run) >= MIN_BASE64_RUN and mixed >= MIN_BASE64_MIXED_RATIO * len(run)
+
+
+def find_encoded_blocks(lines):
+    blocks, i, in_pgp = [], 0, False
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith('-----BEGIN PGP'):
+            in_pgp = True
+        elif line.startswith('-----END PGP'):
+            in_pgp = False
+        elif match := ENCODED_BEGIN.match(line):
+            base64 = bool(match.group(1))
+            end = encoded_block_end(lines, i, '====' if base64 else 'end')
+            blocks.append(EncodedBlock(i, end, f'{"base64-encoded" if base64 else "uuencoded"} {match.group(2)}'))
+            i = end
+            continue
+        elif not in_pgp and BASE64_LINE.match(line):
+            end = base64_run_end(lines, i)
+            if is_base64_payload(lines[i:end]):
+                blocks.append(EncodedBlock(i, end, 'base64-encoded data'))
+            i = end
+            continue
+        i += 1
+    return blocks
+
+
+def collapse_encoded(lines):
+    collapsed, omitted, pos = [], set(), 0
+    for block in find_encoded_blocks(lines):
+        collapsed.extend(lines[pos:block.start])
+        omitted.add(len(collapsed))
+        collapsed.append(f'[ {block.end - block.start:,} lines of {block.description} omitted ]')
+        pos = block.end
+    collapsed.extend(lines[pos:])
+    return collapsed, omitted
+
+
 def parse_article(number, raw):
     meta, body = split_front_matter(clean_text(raw))
-    lines = trim_lines(body)
+    lines, omitted = collapse_encoded(trim_lines(body))
     return Article(
         number=number,
         title=meta.get('title') or f'Phile {number}',
         author=meta.get('author', ''),
         lines=lines,
         sections=find_sections(lines),
+        omitted=omitted,
     )
 
 
@@ -270,6 +346,8 @@ def render_article(article):
         escaped = linkify(line)
         if i in heading_attrs:
             escaped = f'<span class="heading"{heading_attrs[i]}>{escaped}</span>'
+        elif i in article.omitted:
+            escaped = f'<span class="omitted">{escaped}</span>'
         body.append(escaped)
     byline = f'<p class="byline">{html.escape(article.author)}</p>' if article.author else ''
     return f'<h1>{html.escape(article.title)}</h1>{byline}<pre>{chr(10).join(body)}</pre>'
