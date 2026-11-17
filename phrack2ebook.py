@@ -27,9 +27,14 @@ ARCHIVE_URL = 'https://archives.phrack.org/tgz/'
 CONTROL_CHARS = re.compile(r'[\x00-\x08\x0b-\x1f\x7f]')
 SECTION_LINE = re.compile(r'^\s*-{1,4}\[(?!\[)\s*(.+?)\s*$')
 SECTION_NOISE = re.compile(r'\s*(?:-+\[|\]-*|\]?=+-*)\s*')
+URL = re.compile(r'https?://[^\s<>"\'`{}|\\^\[\]]+')
+LINKABLE_URL = re.compile(r'https?://([\w-]+(?:\.[\w-]+)+)')
+RESERVED_TLDS = {'local', 'test', 'example', 'invalid', 'localhost', 'internal', 'lan'}
+RESERVED_DOMAINS = ('example.com', 'example.org', 'example.net')
 
 STYLESHEET = '''
 body { margin: 0 2%; }
+a { color: inherit; }
 .cover { margin: 0; padding: 0; text-align: center; }
 .cover img { display: block; margin: 0 auto; max-width: 100%; max-height: 100vh; }
 h1 { font-family: sans-serif; font-size: 1.4em; margin: 0.5em 0 0.2em; page-break-before: always; }
@@ -156,11 +161,46 @@ def read_articles(tar_path):
     return sorted(articles, key=lambda a: a.number)
 
 
+def trim_url(url):
+    while url and url[-1] in '.,;:!?\'")':
+        if url[-1] == ')' and url.count('(') >= url.count(')'):
+            break
+        url = url[:-1]
+    return url
+
+
+def is_reserved_host(host):
+    return host.rsplit('.', 1)[-1] in RESERVED_TLDS or any(
+        host == domain or host.endswith('.' + domain) for domain in RESERVED_DOMAINS
+    )
+
+
+def is_linkable(url, rest_of_line):
+    match = LINKABLE_URL.match(url)
+    if not match or is_reserved_host(match.group(1).lower()):
+        return False
+    # a trailing '-'/'&' or a shell '\' continuation means the URL was hard-wrapped; linking the fragment would 404
+    return not url.endswith(('-', '&')) and rest_of_line.strip() != '\\'
+
+
+def linkify(line):
+    parts, pos = [], 0
+    for match in URL.finditer(line):
+        url = trim_url(match.group())
+        if not is_linkable(url, line[match.start() + len(url):]):
+            continue
+        parts.append(html.escape(line[pos:match.start()], quote=False))
+        parts.append(f'<a href="{html.escape(url)}">{html.escape(url, quote=False)}</a>')
+        pos = match.start() + len(url)
+    parts.append(html.escape(line[pos:], quote=False))
+    return ''.join(parts)
+
+
 def render_article(article):
     anchors = {line: k for k, (line, _) in enumerate(article.sections)}
     body = []
     for i, line in enumerate(article.lines):
-        escaped = html.escape(line, quote=False)
+        escaped = linkify(line)
         if i in anchors:
             escaped = f'<span id="s{anchors[i]}"></span>{escaped}'
         body.append(escaped)
