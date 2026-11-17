@@ -12,7 +12,7 @@ uv run phrack2ebook.py -n 72
 ```
 
 ```
-usage: phrack2ebook.py [-h] [-n ISSUE | -a] [-f FORMAT] [-o OUTPUT_DIR] [--cache-dir CACHE_DIR]
+usage: phrack2ebook.py [-h] [-n ISSUE | -a] [-f FORMAT] [-o OUTPUT_DIR] [--cache-dir CACHE_DIR] [--force]
 
 Download Phrack issues and convert them to ebooks
 
@@ -25,8 +25,11 @@ options:
                         Output directory (default: output)
   --cache-dir CACHE_DIR
                         Download cache directory
+  --force               Rebuild issues whose output file already exists
 ```
 
-Downloaded issues are cached in `$XDG_CACHE_HOME/phrack2ebook` (or `~/.cache/phrack2ebook`), so re-runs do not download again.
+Downloaded issues are cached in `$XDG_CACHE_HOME/phrack2ebook` (or `~/.cache/phrack2ebook`), so re-runs do not download again. Issues whose output file already exists are skipped unless `--force` is given, so `-a` only builds new issues.
+
+The publication date is taken from the issue's release date on phrack.org; if the site is unreachable the book is built without one.
 
 EPUB works with Kobo and other readers, and with Kindle via Send to Kindle. Other formats (`mobi`, `azw3`, `pdf`, ...) are produced from the EPUB with calibre's `ebook-convert`, which must be on `PATH`.

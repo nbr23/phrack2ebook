@@ -18,6 +18,7 @@ import tarfile
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urljoin
 from typing import NamedTuple
 
 import requests
@@ -25,6 +26,9 @@ from ebooklib import epub
 from PIL import Image, ImageDraw, ImageFont
 
 ARCHIVE_URL = 'https://archives.phrack.org/tgz/'
+SITE_URL = 'https://phrack.org/'
+CANONICAL_LINK = re.compile(r'<link rel="canonical" href="([^"]+)"')
+DATE_PUBLISHED = re.compile(r'"datePublished":"(\d{4}-\d{2}-\d{2})"')
 CONTROL_CHARS = re.compile(r'[\x00-\x08\x0b-\x1f\x7f]')
 SECTION_LINE = re.compile(r'^\s{0,20}-{1,4}\[(?!\[)\s*(.+?)\s*$')
 SECTION_NOISE = re.compile(r'\s*(?:-+\[|\]-+|\]?=+-*|\]\s*$)\s*')
@@ -106,6 +110,22 @@ def fetch_issue(issue, cache_dir):
                 f.write(chunk)
     partial.rename(target)
     return target
+
+
+def issue_date(issue):
+    try:
+        stub = requests.get(f'{SITE_URL}issues/{issue}/1.html', timeout=30)
+        stub.raise_for_status()
+        canonical = CANONICAL_LINK.search(stub.text)
+        page = requests.get(urljoin(stub.url, canonical.group(1)), timeout=30) if canonical else stub
+        page.raise_for_status()
+    except requests.RequestException as e:
+        print(f'Phrack {issue}: release date unavailable ({e})')
+        return None
+    match = DATE_PUBLISHED.search(page.text)
+    if not match:
+        print(f'Phrack {issue}: release date not found on {page.url}')
+    return match and match.group(1)
 
 
 def clean_text(text):
@@ -313,12 +333,14 @@ def toc_entry(article):
     return (epub.Section(article.title, article.file_name), links)
 
 
-def build_epub(issue, articles, path):
+def build_epub(issue, articles, path, date=None):
     book = epub.EpubBook()
     book.set_identifier(f'phrack-{issue}')
     book.set_title(f'Phrack #{issue}')
     book.set_language('en')
     book.add_author('Phrack')
+    if date:
+        book.add_metadata('DC', 'date', date)
     add_series_metadata(book, issue)
     book.set_cover('cover.jpg', make_cover(issue), create_page=False)
 
@@ -347,18 +369,22 @@ def convert(epub_path, out_path):
     subprocess.run(['ebook-convert', str(epub_path), str(out_path)], check=True, stdout=subprocess.DEVNULL)
 
 
-def handle_issue(issue, fmt, output_dir, cache_dir):
+def handle_issue(issue, fmt, output_dir, cache_dir, force):
+    out_path = output_dir / f'phrack{issue}.{fmt}'
+    if out_path.exists() and not force:
+        print(f'Phrack {issue}: {out_path} exists, skipping')
+        return
     articles = read_articles(fetch_issue(issue, cache_dir))
     if not articles:
         raise RuntimeError(f'no articles found in Phrack {issue}')
+    date = issue_date(issue)
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_dir / f'phrack{issue}.{fmt}'
     if fmt == 'epub':
-        build_epub(issue, articles, out_path)
+        build_epub(issue, articles, out_path, date)
     else:
         with tempfile.TemporaryDirectory() as tmp:
             epub_path = Path(tmp) / f'phrack{issue}.epub'
-            build_epub(issue, articles, epub_path)
+            build_epub(issue, articles, epub_path, date)
             convert(epub_path, out_path)
     print(f'Phrack {issue}: {len(articles)} articles -> {out_path}')
 
@@ -384,6 +410,7 @@ def parse_args():
     parser.add_argument('-f', '--format', default='epub', help='Output format; non-epub formats need calibre (default: epub)')
     parser.add_argument('-o', '--output-dir', type=Path, default=Path('output'), help='Output directory (default: output)')
     parser.add_argument('--cache-dir', type=Path, default=default_cache_dir(), help='Download cache directory')
+    parser.add_argument('--force', action='store_true', help='Rebuild issues whose output file already exists')
     args = parser.parse_args()
     if args.issue:
         try:
@@ -404,7 +431,7 @@ def main():
         elif not args.issue:
             args.issues = [latest_issue()]
         for issue in args.issues:
-            handle_issue(issue, fmt, args.output_dir, args.cache_dir)
+            handle_issue(issue, fmt, args.output_dir, args.cache_dir, args.force)
     except (requests.RequestException, RuntimeError, subprocess.CalledProcessError, tarfile.TarError) as e:
         sys.exit(f'error: {e}')
 
