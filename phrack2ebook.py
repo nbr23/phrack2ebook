@@ -18,6 +18,7 @@ import tarfile
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
 import requests
 from ebooklib import epub
@@ -25,8 +26,12 @@ from PIL import Image, ImageDraw, ImageFont
 
 ARCHIVE_URL = 'https://archives.phrack.org/tgz/'
 CONTROL_CHARS = re.compile(r'[\x00-\x08\x0b-\x1f\x7f]')
-SECTION_LINE = re.compile(r'^\s*-{1,4}\[(?!\[)\s*(.+?)\s*$')
-SECTION_NOISE = re.compile(r'\s*(?:-+\[|\]-*|\]?=+-*)\s*')
+SECTION_LINE = re.compile(r'^\s{0,20}-{1,4}\[(?!\[)\s*(.+?)\s*$')
+SECTION_NOISE = re.compile(r'\s*(?:-+\[|\]-+|\]?=+-*|\]\s*$)\s*')
+SECTION_REJECT = re.compile(r'@[^\]]*\][$#%]|\]-*>')
+SECTION_CLOSED = re.compile(r'\]\s*[-=]*\s*$')
+WRAPPED_HEADING_MIN_LENGTH = 60
+MAX_HEADING_CONTINUATIONS = 2
 URL = re.compile(r'https?://[^\s<>"\'`{}|\\^\[\]]+')
 LINKABLE_URL = re.compile(r'https?://([\w-]+(?:\.[\w-]+)+)')
 RESERVED_TLDS = {'local', 'test', 'example', 'invalid', 'localhost', 'internal', 'lan'}
@@ -39,6 +44,7 @@ a { color: inherit; }
 .cover img { display: block; margin: 0 auto; max-width: 100%; max-height: 100vh; }
 h1 { font-family: sans-serif; font-size: 1.4em; margin: 0.5em 0 0.2em; page-break-before: always; }
 .byline { font-family: sans-serif; font-style: italic; margin: 0 0 1.5em; }
+pre .heading { font-weight: bold; }
 pre {
     white-space: pre-wrap;
     word-wrap: break-word;
@@ -55,13 +61,19 @@ ol.contents .author { display: block; font-size: 0.85em; font-style: italic; }
 '''
 
 
+class Heading(NamedTuple):
+    start: int
+    end: int
+    label: str
+
+
 @dataclass
 class Article:
     number: int
     title: str
     author: str
     lines: list[str]
-    sections: list[tuple[int, str]] = field(default_factory=list)
+    sections: list[Heading] = field(default_factory=list)
 
     @property
     def file_name(self):
@@ -124,18 +136,46 @@ def trim_lines(text):
     return lines
 
 
+def normalize_label(text):
+    text = SECTION_NOISE.sub(' ', text)
+    if '[' not in text:
+        text = text.replace(']', ' ')
+    return ' '.join(text.split()).strip(' -=')
+
+
 def section_label(line):
     match = SECTION_LINE.match(line)
-    if not match:
+    if not match or SECTION_REJECT.search(line):
         return None
-    label = ' '.join(SECTION_NOISE.sub(' ', match.group(1)).split()).strip(' -=]')
+    label = normalize_label(match.group(1))
     if not re.search(r'\w', label) or len(label) > 80 or label.upper().startswith('END'):
         return None
     return label
 
 
+def heading_end(lines, start):
+    if len(lines[start].strip()) < WRAPPED_HEADING_MIN_LENGTH or SECTION_CLOSED.search(lines[start]):
+        return start + 1
+    end = start + 1
+    while (
+        end < len(lines)
+        and end - start <= MAX_HEADING_CONTINUATIONS
+        and lines[end].strip()
+        and not SECTION_LINE.match(lines[end])
+    ):
+        end += 1
+        if end == len(lines) or not lines[end].strip():
+            return end
+    return start + 1
+
+
 def find_sections(lines):
-    return [(i, label) for i, line in enumerate(lines) if (label := section_label(line))]
+    headings = []
+    for i, line in enumerate(lines):
+        if label := section_label(line):
+            end = heading_end(lines, i)
+            headings.append(Heading(i, end, normalize_label(' '.join([label, *lines[i + 1:end]]))))
+    return headings
 
 
 def parse_article(number, raw):
@@ -197,12 +237,15 @@ def linkify(line):
 
 
 def render_article(article):
-    anchors = {line: k for k, (line, _) in enumerate(article.sections)}
+    heading_attrs = {}
+    for k, heading in enumerate(article.sections):
+        heading_attrs[heading.start] = f' id="s{k}"'
+        heading_attrs.update(dict.fromkeys(range(heading.start + 1, heading.end), ''))
     body = []
     for i, line in enumerate(article.lines):
         escaped = linkify(line)
-        if i in anchors:
-            escaped = f'<span id="s{anchors[i]}"></span>{escaped}'
+        if i in heading_attrs:
+            escaped = f'<span class="heading"{heading_attrs[i]}>{escaped}</span>'
         body.append(escaped)
     byline = f'<p class="byline">{html.escape(article.author)}</p>' if article.author else ''
     return f'<h1>{html.escape(article.title)}</h1>{byline}<pre>{chr(10).join(body)}</pre>'
@@ -264,8 +307,8 @@ def toc_entry(article):
     if not article.sections:
         return epub.Link(article.file_name, article.title, f'p{article.number}')
     links = [
-        epub.Link(f'{article.file_name}#s{k}', label, f'p{article.number}s{k}')
-        for k, (_, label) in enumerate(article.sections)
+        epub.Link(f'{article.file_name}#s{k}', heading.label, f'p{article.number}s{k}')
+        for k, heading in enumerate(article.sections)
     ]
     return (epub.Section(article.title, article.file_name), links)
 
