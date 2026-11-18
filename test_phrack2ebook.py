@@ -209,10 +209,18 @@ def test_linkify_strips_trailing_punctuation():
         'http://localhost:8080/',
         'http://intranet.lan/',
         'just http:// alone',
+        'http://undocumented.ntinternals.net/UserMode/Undocumented%20Functions/NT%2',
+        'http://127.1:631',
+        '"https://accounts.google.com:443,https://accounts.google.com:443"',
     ],
 )
 def test_linkify_skips_unlinkable_urls(line):
     assert '<a ' not in linkify(line)
+
+
+@pytest.mark.parametrize('url', ['http://10.0.0.1:8080/x', 'https://phrack.org', 'http://a.org/%41b'])
+def test_linkify_links_valid_hosts(url):
+    assert linkify(url) == f'<a href="{url}">{url}</a>'
 
 
 def test_render_article_marks_headings_with_anchor_and_escapes():

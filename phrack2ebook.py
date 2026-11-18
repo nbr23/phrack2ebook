@@ -57,7 +57,8 @@ MIN_TEXT_RATIO = 0.95
 IMAGE_SUFFIXES = {'.gif', '.jpg', '.jpeg', '.png', '.pcx', '.bmp'}
 EPUB_IMAGE_TYPES = {'GIF': ('image/gif', 'gif'), 'JPEG': ('image/jpeg', 'jpg'), 'PNG': ('image/png', 'png')}
 URL = re.compile(r'https?://[^\s<>"\'`{}|\\^\[\]]+')
-LINKABLE_URL = re.compile(r'https?://([\w-]+(?:\.[\w-]+)+)')
+LINKABLE_URL = re.compile(r'https?://((?:\d{1,3}\.){3}\d{1,3}|[\w-]+(?:\.[\w-]+)*\.[a-zA-Z][\w-]*)(?::\d+)?(?=[/?#]|$)')
+BROKEN_PERCENT_ESCAPE = re.compile(r'%(?![0-9a-fA-F]{2})')
 RESERVED_TLDS = {'local', 'test', 'example', 'invalid', 'localhost', 'internal', 'lan'}
 RESERVED_DOMAINS = ('example.com', 'example.org', 'example.net')
 
@@ -476,7 +477,11 @@ def is_linkable(url, rest_of_line):
     if not match or is_reserved_host(match.group(1).lower()):
         return False
     # a trailing '-'/'&' or a shell '\' continuation means the URL was hard-wrapped; linking the fragment would 404
-    return not url.endswith(('-', '&')) and rest_of_line.strip() != '\\'
+    return (
+        not url.endswith(('-', '&'))
+        and not BROKEN_PERCENT_ESCAPE.search(url)
+        and rest_of_line.strip() != '\\'
+    )
 
 
 def linkify(line):
