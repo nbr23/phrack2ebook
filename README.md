@@ -34,6 +34,19 @@ The publication date is taken from the issue's release date on phrack.org; if th
 
 EPUB works with Kobo and other readers, and with Kindle via Send to Kindle. Other formats (`mobi`, `azw3`, `pdf`, ...) are produced from the EPUB with calibre's `ebook-convert`, which must be on `PATH`.
 
+## Docker
+
+The image bundles calibre, so every output format works out of the box:
+
+```
+docker build -t phrack2ebook .
+docker run --rm -v "$PWD/output:/data/output" -v phrack2ebook-cache:/cache phrack2ebook -n 72 -f azw3
+```
+
+## Releases
+
+Ready-made EPUB and AZW3 files are published as one GitHub release per issue (`phrack-<N>`). The `ebooks` workflow runs the tests, builds the image, builds every issue, validates the output (epubcheck, expected contents, AZW3 metadata) and only then publishes. A push to `master` that touches the converter rebuilds and replaces every release. A manual run takes an issue selection, can replace existing releases, and can skip publishing to just keep the checked output as a workflow artifact.
+
 ## Tests
 
 ```

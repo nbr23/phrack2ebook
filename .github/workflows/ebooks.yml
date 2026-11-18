@@ -1,0 +1,139 @@
+name: ebooks
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - phrack2ebook.py
+      - test_phrack2ebook.py
+      - Dockerfile
+      - .github/**
+  workflow_dispatch:
+    inputs:
+      issues:
+        description: Issues to build (all, latest, or a spec such as 72, 60-73 or 1,5,70-72)
+        type: string
+        default: all
+      replace:
+        description: Replace the assets of issues that already have a release
+        type: boolean
+        default: false
+      publish:
+        description: Publish releases (off = build and check only, output kept as a workflow artifact)
+        type: boolean
+        default: true
+
+concurrency:
+  group: ebooks
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  ISSUES: ${{ inputs.issues || 'all' }}
+  REPLACE: ${{ github.event_name == 'push' || inputs.replace }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+      - run: uv run --no-project --with-requirements phrack2ebook.py --with pytest -- pytest -q -p no:cacheprovider
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - id: ref
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:sha-${GITHUB_SHA}" >>"$GITHUB_OUTPUT"
+
+  build:
+    needs: image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    env:
+      IMAGE: ${{ needs.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/cache@v6
+        with:
+          path: cache
+          key: phrack-tgz-${{ github.run_id }}
+          restore-keys: phrack-tgz-
+      - name: Install epubcheck
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends epubcheck
+      - name: Build ebooks
+        run: |
+          case "$ISSUES" in
+            all) selection=(-a) ;;
+            latest) selection=() ;;
+            *) selection=(-n "$ISSUES") ;;
+          esac
+          mkdir -p output cache
+          for fmt in epub azw3; do
+            docker run --rm -v "$PWD/output:/data/output" -v "$PWD/cache:/cache" "$IMAGE" "${selection[@]}" -f "$fmt"
+          done
+      - name: Check ebooks
+        run: .github/scripts/check-output.sh output
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ebooks
+          path: output/
+          retention-days: 14
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: ebooks
+          path: output
+      - name: Publish releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: .github/scripts/publish.sh output
